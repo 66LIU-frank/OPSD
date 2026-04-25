@@ -160,7 +160,8 @@ bash scripts/run_rc_opsd_social.sh
 
 The prototype keeps the original OPSD loss, but changes the privileged context source. For each on-policy student
 completion, the same model first generates a retrospective reflection, then the teacher forward pass conditions on
-that private reflection while matching the student's sampled tokens.
+that private reflection while matching the student's sampled tokens. A lightweight quality filter can mask examples
+whose reflections are too short or obviously uninformative.
 
 Local JSON/JSONL datasets can be passed with `--dataset_name_or_path`. The collator accepts either a ready-made
 `prompt` field or structured social fields such as `scenario`, `agent_persona`, `opponent_persona`, `agent_goal`,

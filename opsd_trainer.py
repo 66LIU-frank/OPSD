@@ -147,6 +147,8 @@ class OPSDTrainer(SFTTrainer):
         rc_curriculum_schedule: str = "retract",
         rc_curriculum_steps: int = 100,
         max_reflection_length: int = 512,
+        rc_filter_bad_reflections: bool = True,
+        rc_min_reflection_chars: int = 40,
     ):
         self.use_rc_opd = use_rc_opd
         if self.use_rc_opd and reason_first:
@@ -211,6 +213,8 @@ class OPSDTrainer(SFTTrainer):
         self.rc_curriculum_schedule = rc_curriculum_schedule.lower()
         self.rc_curriculum_steps = max(0, int(rc_curriculum_steps))
         self.max_reflection_length = max_reflection_length
+        self.rc_filter_bad_reflections = rc_filter_bad_reflections
+        self.rc_min_reflection_chars = max(0, int(rc_min_reflection_chars))
         self._ema_params = None  # lazily initialized on first optimizer step
 
         # Validate fixed_teacher option
@@ -254,6 +258,8 @@ class OPSDTrainer(SFTTrainer):
             print(f"Curriculum schedule: {self.rc_curriculum_schedule}")
             print(f"Curriculum steps: {self.rc_curriculum_steps}")
             print(f"Max reflection length: {self.max_reflection_length}")
+            print(f"Filter bad reflections: {self.rc_filter_bad_reflections}")
+            print(f"Min reflection chars: {self.rc_min_reflection_chars}")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -1282,6 +1288,19 @@ class OPSDTrainer(SFTTrainer):
         )
         return self._apply_chat_template_text(content, enable_thinking=False)
 
+    def _is_rc_reflection_usable(self, reflection: str) -> bool:
+        text = (reflection or "").strip()
+        if len(text) < self.rc_min_reflection_chars:
+            return False
+        lower = text.lower()
+        low_information_markers = [
+            "i don't know",
+            "cannot determine",
+            "not enough information",
+            "no reflection",
+        ]
+        return not any(marker in lower for marker in low_information_markers)
+
     def _generate_text_prompts_vllm(self, prompts: list[str], max_tokens: int) -> list[str]:
         if self.processing_class.pad_token:
             prompts = [prompt.replace(self.processing_class.pad_token, "") for prompt in prompts]
@@ -1666,6 +1685,7 @@ class OPSDTrainer(SFTTrainer):
         generation_ids = generated_ids[:, student_prompt_len:]
 
         reflection_texts = None
+        reflection_keep_mask = None
         if self.use_rc_opd:
             raw_prompt_texts = inputs.get("student_prompt_texts")
             if raw_prompt_texts is not None:
@@ -1681,6 +1701,13 @@ class OPSDTrainer(SFTTrainer):
                     reflection_texts = self.generate_rc_reflections(
                         unwrapped_model, prompt_texts, completion_texts, active_levels
                     )
+
+            reflection_keep_mask = [
+                self._is_rc_reflection_usable(reflection) for reflection in reflection_texts
+            ]
+            keep_rate = sum(reflection_keep_mask) / max(1, len(reflection_keep_mask))
+            self._metrics["train"]["rc_reflection_keep_rate"].append(keep_rate)
+            self._metrics["train"]["rc_active_level_count"].append(float(len(active_levels)))
 
             teacher_prompt_texts = [
                 self._build_rc_teacher_prompt(prompt, reflection, active_levels)
@@ -1730,6 +1757,17 @@ class OPSDTrainer(SFTTrainer):
 
         if self.processing_class.pad_token_id is not None:
             labels[labels == self.processing_class.pad_token_id] = -100
+
+        if (
+            self.use_rc_opd
+            and self.rc_filter_bad_reflections
+            and reflection_keep_mask is not None
+            and any(reflection_keep_mask)
+            and not all(reflection_keep_mask)
+        ):
+            for i, keep in enumerate(reflection_keep_mask):
+                if not keep:
+                    labels[i, :] = -100
 
         inputs["labels"] = labels
 

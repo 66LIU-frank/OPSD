@@ -23,6 +23,8 @@ accelerate launch \
     --rc_curriculum_schedule retract \
     --rc_curriculum_steps 100 \
     --max_reflection_length 384 \
+    --rc_filter_bad_reflections \
+    --rc_min_reflection_chars 40 \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
     --per_device_train_batch_size 1 \

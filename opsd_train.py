@@ -131,6 +131,16 @@ class CustomScriptArguments(ScriptArguments):
         default=512,
         metadata={"help": "Maximum tokens generated for each retrospective reflection."},
     )
+    rc_filter_bad_reflections: bool = field(
+        default=True,
+        metadata={
+            "help": "Mask RC-OPD loss for examples whose generated reflection fails simple quality checks."
+        },
+    )
+    rc_min_reflection_chars: int = field(
+        default=40,
+        metadata={"help": "Minimum non-whitespace characters required for an RC-OPD reflection to be trusted."},
+    )
 
 
 def load_train_dataset(script_args: CustomScriptArguments):
@@ -256,6 +266,8 @@ if __name__ == "__main__":
                 "rc_curriculum_schedule": script_args.rc_curriculum_schedule if script_args.use_rc_opd else None,
                 "rc_curriculum_steps": script_args.rc_curriculum_steps if script_args.use_rc_opd else None,
                 "max_reflection_length": script_args.max_reflection_length if script_args.use_rc_opd else None,
+                "rc_filter_bad_reflections": script_args.rc_filter_bad_reflections if script_args.use_rc_opd else None,
+                "rc_min_reflection_chars": script_args.rc_min_reflection_chars if script_args.use_rc_opd else None,
             },
         )
 
@@ -345,6 +357,8 @@ if __name__ == "__main__":
         rc_curriculum_schedule=script_args.rc_curriculum_schedule,
         rc_curriculum_steps=script_args.rc_curriculum_steps,
         max_reflection_length=script_args.max_reflection_length,
+        rc_filter_bad_reflections=script_args.rc_filter_bad_reflections,
+        rc_min_reflection_chars=script_args.rc_min_reflection_chars,
     )
 
     if training_args.eval_strategy != "no":
