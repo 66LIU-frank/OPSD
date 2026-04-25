@@ -150,6 +150,22 @@ See [`scripts/run_sft.sh`](scripts/run_sft.sh).
 
 See [`scripts/run_grpo.sh`](scripts/run_grpo.sh).
 
+### RC-OPD Social-Agent Prototype
+
+This fork adds an experimental retrospective-curriculum OPD path for social-agent prompts:
+
+```bash
+bash scripts/run_rc_opsd_social.sh
+```
+
+The prototype keeps the original OPSD loss, but changes the privileged context source. For each on-policy student
+completion, the same model first generates a retrospective reflection, then the teacher forward pass conditions on
+that private reflection while matching the student's sampled tokens.
+
+Local JSON/JSONL datasets can be passed with `--dataset_name_or_path`. The collator accepts either a ready-made
+`prompt` field or structured social fields such as `scenario`, `agent_persona`, `opponent_persona`, `agent_goal`,
+`dialogue_history`, and `instruction`. See [`examples/rc_opd_social_sample.jsonl`](examples/rc_opd_social_sample.jsonl).
+
 ### Acknowledgements
 Our implementation builds on [TRL GOLD Trainer](https://huggingface.co/docs/trl/gold_trainer). We sincerely thank [@simran135](https://github.com/simran135) and [@beanie00](https://github.com/beanie00) for identifying the prompt template bugs and the zero-2 issue, respectively!
 

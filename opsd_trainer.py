@@ -61,7 +61,7 @@ from trl.trainer.utils import (
     pad,
 )
 from trl.experimental.gold.gold_config import GOLDConfig
-from data_collator import SelfDistillationDataCollator
+from data_collator import SelfDistillationDataCollator, SocialReflectionDataCollator
 
 
 if is_peft_available():
@@ -142,18 +142,37 @@ class OPSDTrainer(SFTTrainer):
         jsd_token_clip: float | None = None,
         use_ema_teacher: bool = False,
         ema_decay: float = 0.999,
+        use_rc_opd: bool = False,
+        rc_reflection_levels: str = "step,turn,episode",
+        rc_curriculum_schedule: str = "retract",
+        rc_curriculum_steps: int = 100,
+        max_reflection_length: int = 512,
     ):
+        self.use_rc_opd = use_rc_opd
+        if self.use_rc_opd and reason_first:
+            raise ValueError("use_rc_opd=True is incompatible with reason_first=True.")
+
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         if isinstance(model, str) and self.model_revision is not None:
             args.model_init_kwargs = args.model_init_kwargs or {}
             args.model_init_kwargs.setdefault("revision", self.model_revision)
 
+        # OPSD builds student/teacher sequences inside the custom collator and
+        # training_step, so SFTTrainer's language-modeling preprocessing is not used.
+        args.dataset_kwargs = args.dataset_kwargs or {}
+        args.dataset_kwargs["skip_prepare_dataset"] = True
+
         # Custom data collator for self-distillation
         if data_collator is None:
-            data_collator = SelfDistillationDataCollator(
-                tokenizer=processing_class, max_length=args.max_length, reason_first=reason_first
-            )
+            if self.use_rc_opd:
+                data_collator = SocialReflectionDataCollator(
+                    tokenizer=processing_class, max_length=args.max_length
+                )
+            else:
+                data_collator = SelfDistillationDataCollator(
+                    tokenizer=processing_class, max_length=args.max_length, reason_first=reason_first
+                )
 
         super().__init__(
             model,
@@ -184,6 +203,14 @@ class OPSDTrainer(SFTTrainer):
         self.jsd_token_clip = jsd_token_clip
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
+        self.rc_reflection_levels = [
+            level.strip().lower()
+            for level in rc_reflection_levels.split(",")
+            if level.strip()
+        ] or ["episode"]
+        self.rc_curriculum_schedule = rc_curriculum_schedule.lower()
+        self.rc_curriculum_steps = max(0, int(rc_curriculum_steps))
+        self.max_reflection_length = max_reflection_length
         self._ema_params = None  # lazily initialized on first optimizer step
 
         # Validate fixed_teacher option
@@ -218,6 +245,15 @@ class OPSDTrainer(SFTTrainer):
             print(f"\n{'='*80}")
             print("REASON FIRST MODE ENABLED")
             print("Teacher will first reason about the privileged solution, then evaluate student's response")
+            print(f"{'='*80}\n")
+
+        if self.use_rc_opd:
+            print(f"\n{'='*80}")
+            print("RC-OPD MODE ENABLED")
+            print(f"Reflection levels: {', '.join(self.rc_reflection_levels)}")
+            print(f"Curriculum schedule: {self.rc_curriculum_schedule}")
+            print(f"Curriculum steps: {self.rc_curriculum_steps}")
+            print(f"Max reflection length: {self.max_reflection_length}")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -263,6 +299,21 @@ class OPSDTrainer(SFTTrainer):
             and self.model.generation_config.eos_token_id is not None
         ):
             self.reasoning_generation_config.eos_token_id = self.model.generation_config.eos_token_id
+
+        self.reflection_generation_config = GenerationConfig(
+            max_new_tokens=self.max_reflection_length,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=True,
+            top_k=args.top_k,
+            pad_token_id=self.processing_class.pad_token_id,
+            use_cache=True,
+        )
+        if (
+            hasattr(self.model.generation_config, "eos_token_id")
+            and self.model.generation_config.eos_token_id is not None
+        ):
+            self.reflection_generation_config.eos_token_id = self.model.generation_config.eos_token_id
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -361,10 +412,37 @@ class OPSDTrainer(SFTTrainer):
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
-        required_columns = [
-            "problem",
-            "solution",
-        ]
+        if self.use_rc_opd:
+            required_columns = [
+                "prompt",
+                "input",
+                "question",
+                "scenario",
+                "environment",
+                "background",
+                "agent_persona",
+                "persona",
+                "self_persona",
+                "opponent_persona",
+                "partner_persona",
+                "other_persona",
+                "agent_goal",
+                "goal",
+                "private_goal",
+                "self_goal",
+                "dialogue_history",
+                "conversation",
+                "messages",
+                "history",
+                "transcript",
+                "instruction",
+                "task",
+            ]
+        else:
+            required_columns = [
+                "problem",
+                "solution",
+            ]
         if self._signature_columns is None:
             self._signature_columns = required_columns
         else:
@@ -1137,6 +1215,209 @@ class OPSDTrainer(SFTTrainer):
 
         return reasoning_ids
 
+    def _active_rc_reflection_levels(self) -> list[str]:
+        """Return reflection levels still visible to the teacher at the current step."""
+        configured = [level for level in self.rc_reflection_levels if level in {"step", "turn", "episode"}]
+        if not configured:
+            configured = ["episode"]
+
+        if self.rc_curriculum_schedule in {"none", "constant"} or self.rc_curriculum_steps <= 0:
+            return configured
+
+        progress = min(1.0, float(self.state.global_step) / float(self.rc_curriculum_steps))
+        if self.rc_curriculum_schedule == "retract":
+            if progress < 1.0 / 3.0:
+                desired = ["step", "turn", "episode"]
+            elif progress < 2.0 / 3.0:
+                desired = ["turn", "episode"]
+            else:
+                desired = ["episode"]
+        elif self.rc_curriculum_schedule == "linear":
+            desired = ["step", "turn", "episode"] if progress < 0.5 else ["episode"]
+        else:
+            desired = configured
+
+        active = [level for level in configured if level in desired]
+        return active or [configured[-1]]
+
+    def _apply_chat_template_text(self, user_content: str, enable_thinking: bool = False) -> str:
+        messages = [{"role": "user", "content": user_content}]
+        kwargs = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": enable_thinking}
+        try:
+            return self.processing_class.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            return self.processing_class.apply_chat_template(messages, **kwargs)
+
+    @staticmethod
+    def _reflection_level_instructions(levels: list[str]) -> str:
+        descriptions = {
+            "step": "Step level: identify the local wording or tactical choices that helped or hurt the goal.",
+            "turn": "Turn level: assess whether the response matched the social strategy needed in this exchange.",
+            "episode": "Episode level: judge likely goal progress, relationship impact, and what should be internalized.",
+        }
+        return "\n".join(f"- {descriptions[level]}" for level in levels if level in descriptions)
+
+    def _build_rc_reflection_prompt(self, prompt: str, completion: str, levels: list[str]) -> str:
+        level_text = self._reflection_level_instructions(levels)
+        content = (
+            "You are retrospectively critiquing a social-agent response after it was produced.\n"
+            "Use concise, actionable observations. Do not rewrite the response verbatim.\n\n"
+            f"Original social-agent prompt:\n{prompt}\n\n"
+            f"Student response:\n{completion}\n\n"
+            f"Reflection levels to provide:\n{level_text}\n\n"
+            "Return the reflection as short labeled sections."
+        )
+        return self._apply_chat_template_text(content, enable_thinking=False)
+
+    def _build_rc_teacher_prompt(self, prompt: str, reflection: str, levels: list[str]) -> str:
+        level_names = ", ".join(levels)
+        content = (
+            "You are the privileged teacher in retrospective-curriculum on-policy distillation.\n"
+            "You receive a private reflection that the student will not see at inference time.\n"
+            "Use it to choose a better next-token distribution for the original social-agent task.\n\n"
+            f"Original social-agent prompt:\n{prompt}\n\n"
+            f"Private retrospective reflection ({level_names}):\n{reflection}\n\n"
+            "Now respond to the original social-agent prompt. Produce the agent's next message only."
+        )
+        return self._apply_chat_template_text(content, enable_thinking=False)
+
+    def _generate_text_prompts_vllm(self, prompts: list[str], max_tokens: int) -> list[str]:
+        if self.processing_class.pad_token:
+            prompts = [prompt.replace(self.processing_class.pad_token, "") for prompt in prompts]
+
+        top_k = (
+            self.reflection_generation_config.top_k
+            if self.reflection_generation_config.top_k and self.reflection_generation_config.top_k > 0
+            else -1
+        )
+        top_p = self.args.top_p if hasattr(self.args, "top_p") else 1.0
+        temperature = self.reflection_generation_config.temperature
+
+        if self.vllm_mode == "server":
+            all_prompts = gather_object(prompts)
+            if self.accelerator.is_main_process:
+                generated_ids = self.vllm_client.generate(
+                    prompts=all_prompts,
+                    n=1,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_tokens=max_tokens,
+                )
+                all_texts = [
+                    self.processing_class.decode(ids, skip_special_tokens=True)
+                    for ids in generated_ids
+                ]
+            else:
+                all_texts = [None] * len(all_prompts)
+            all_texts = broadcast_object_list(all_texts, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            return all_texts[process_slice]
+
+        if self.vllm_mode == "colocate":
+            sampling_params = SamplingParams(
+                n=1,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+            )
+
+            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
+                orig_size = len(prompts)
+                gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
+                torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.vllm_tp_group)
+                all_prompts = [prompt for sublist in gathered_prompts for prompt in sublist]
+            else:
+                all_prompts = prompts
+
+            all_outputs = self.vllm_engine.generate(all_prompts, sampling_params=sampling_params, use_tqdm=False)
+            texts = [output.text for outputs in all_outputs for output in outputs.outputs]
+
+            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
+                local_rank_in_group = torch.distributed.get_rank(group=self.vllm_tp_group)
+                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                texts = texts[tp_slice]
+
+            if self.vllm_enable_sleep_mode:
+                self.vllm_engine.sleep(level=2)
+            return texts
+
+        raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
+
+    def generate_rc_reflections(
+        self,
+        model,
+        prompt_texts: list[str],
+        completion_texts: list[str],
+        active_levels: list[str],
+    ) -> list[str]:
+        """Generate same-model retrospective reflections for RC-OPD."""
+        reflection_prompts = [
+            self._build_rc_reflection_prompt(prompt, completion, active_levels)
+            for prompt, completion in zip(prompt_texts, completion_texts)
+        ]
+
+        if self.use_vllm:
+            self._wake_vllm_if_needed()
+            return self._generate_text_prompts_vllm(reflection_prompts, self.max_reflection_length)
+
+        device = self.accelerator.device
+        max_reflection_prompt_len = (
+            max(1, self.args.max_length - self.max_reflection_length)
+            if self.args.max_length is not None
+            else None
+        )
+        tokenized = self.processing_class(
+            reflection_prompts,
+            return_tensors="pt",
+            padding="longest",
+            truncation=max_reflection_prompt_len is not None,
+            max_length=max_reflection_prompt_len,
+            add_special_tokens=False,
+        ).to(device)
+
+        original_use_cache = model.config.use_cache
+        original_gen_use_cache = self.reflection_generation_config.use_cache
+        model.config.use_cache = True
+        self.reflection_generation_config.use_cache = True
+        try:
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=tokenized.input_ids,
+                    attention_mask=tokenized.attention_mask,
+                    generation_config=self.reflection_generation_config,
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
+        finally:
+            model.config.use_cache = original_use_cache
+            self.reflection_generation_config.use_cache = original_gen_use_cache
+
+        prompt_len = tokenized.input_ids.shape[1]
+        completion_ids = outputs.sequences[:, prompt_len:]
+        return self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+    def _encode_rc_teacher_prompts(self, teacher_prompt_texts: list[str], completion_len: int, device):
+        if self.args.max_length is not None:
+            max_prompt_len = max(1, int(self.args.max_length) - int(completion_len))
+        else:
+            max_prompt_len = None
+
+        encoded = self.processing_class(
+            teacher_prompt_texts,
+            return_tensors="pt",
+            padding="longest",
+            truncation=max_prompt_len is not None,
+            max_length=max_prompt_len,
+            add_special_tokens=False,
+        ).to(device)
+        return encoded.input_ids, encoded.attention_mask
+
     def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with student vLLM."""
         if visited is None:
@@ -1384,6 +1665,46 @@ class OPSDTrainer(SFTTrainer):
         # Extract generation part (same slice for all examples since prompts are padded)
         generation_ids = generated_ids[:, student_prompt_len:]
 
+        reflection_texts = None
+        if self.use_rc_opd:
+            raw_prompt_texts = inputs.get("student_prompt_texts")
+            if raw_prompt_texts is not None:
+                prompt_texts = list(raw_prompt_texts)
+
+            active_levels = self._active_rc_reflection_levels()
+            if self.use_vllm:
+                reflection_texts = self.generate_rc_reflections(
+                    model, prompt_texts, completion_texts, active_levels
+                )
+            else:
+                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                    reflection_texts = self.generate_rc_reflections(
+                        unwrapped_model, prompt_texts, completion_texts, active_levels
+                    )
+
+            teacher_prompt_texts = [
+                self._build_rc_teacher_prompt(prompt, reflection, active_levels)
+                for prompt, reflection in zip(prompt_texts, reflection_texts)
+            ]
+            teacher_prompts, teacher_prompt_attention_mask = self._encode_rc_teacher_prompts(
+                teacher_prompt_texts,
+                completion_len=generation_ids.shape[1],
+                device=generated_ids.device,
+            )
+            inputs["teacher_prompts"] = teacher_prompts
+            inputs["teacher_prompt_attention_mask"] = teacher_prompt_attention_mask
+            inputs["teacher_prompt_length"] = teacher_prompts.shape[1]
+
+            if random.random() < 0.01:
+                sample_idx = random.randint(0, len(reflection_texts) - 1)
+                print(f"\n{'='*80}")
+                print(f"RC-OPD REFLECTION SAMPLE (Step {self.state.global_step}):")
+                print(f"{'='*80}")
+                print(f"\nPrompt:\n{prompt_texts[sample_idx]}")
+                print(f"\nCompletion:\n{completion_texts[sample_idx]}")
+                print(f"\nReflection:\n{reflection_texts[sample_idx]}")
+                print(f"{'='*80}\n")
+
         # Construct student full sequence: [student_prompt][generation]
         inputs["student_input_ids"] = generated_ids
         inputs["student_attention_mask"] = generated_attention_mask
@@ -1417,10 +1738,21 @@ class OPSDTrainer(SFTTrainer):
         self._textual_logs["completion"].extend(gather_object(completion_texts))
 
         # Collect generation outputs for saving
-        for prompt, completion in zip(prompt_texts, completion_texts):
-            self._generation_outputs_buffer.append(
-                {"step": self.state.global_step, "prompt": prompt, "completion": completion}
-            )
+        if reflection_texts is None:
+            for prompt, completion in zip(prompt_texts, completion_texts):
+                self._generation_outputs_buffer.append(
+                    {"step": self.state.global_step, "prompt": prompt, "completion": completion}
+                )
+        else:
+            for prompt, completion, reflection in zip(prompt_texts, completion_texts, reflection_texts):
+                self._generation_outputs_buffer.append(
+                    {
+                        "step": self.state.global_step,
+                        "prompt": prompt,
+                        "completion": completion,
+                        "reflection": reflection,
+                    }
+                )
 
         # Occasionally print student's generation with 1% probability
         if random.random() < 0.01:

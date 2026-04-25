@@ -1,6 +1,41 @@
 import torch
 
 
+def _stringify_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                speaker = item.get("speaker") or item.get("role") or item.get("name") or "speaker"
+                content = item.get("content") or item.get("text") or item.get("utterance") or ""
+                parts.append(f"{speaker}: {content}")
+            else:
+                parts.append(str(item))
+        text = "\n".join(part for part in parts if part.strip()).strip()
+        return text or None
+    if isinstance(value, dict):
+        parts = [f"{key}: {val}" for key, val in value.items() if val is not None]
+        text = "\n".join(parts).strip()
+        return text or None
+    return str(value).strip() or None
+
+
+def _apply_chat_template(tokenizer, messages, enable_thinking=None):
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
 class SelfDistillationDataCollator:
     """
     Data collator for self-distillation that creates both student and teacher inputs.
@@ -195,3 +230,92 @@ class SelfDistillationDataCollator:
             )
 
         return result
+
+
+class SocialReflectionDataCollator:
+    """
+    Data collator for RC-OPD social-agent prompts.
+
+    It only builds the student prompt. The trainer generates the on-policy response,
+    then produces retrospective reflections and constructs the teacher prompt.
+    """
+
+    def __init__(self, tokenizer, max_length=2048, prompt_field="prompt"):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.prompt_field = prompt_field
+
+        print(f"[SocialReflectionDataCollator] Original padding_side: {self.tokenizer.padding_side}")
+        self.tokenizer.padding_side = "right"
+        print(f"[SocialReflectionDataCollator] Set padding_side to: {self.tokenizer.padding_side}")
+
+    @staticmethod
+    def _first_feature_text(feature, names):
+        for name in names:
+            if name in feature:
+                text = _stringify_value(feature[name])
+                if text:
+                    return text
+        return None
+
+    def _build_student_prompt(self, feature):
+        direct_prompt = self._first_feature_text(feature, [self.prompt_field, "input", "question"])
+        if direct_prompt:
+            return direct_prompt
+
+        sections = []
+        field_groups = [
+            ("Scenario", ["scenario", "environment", "background"]),
+            ("Agent persona", ["agent_persona", "persona", "self_persona"]),
+            ("Opponent persona", ["opponent_persona", "partner_persona", "other_persona"]),
+            ("Private goal", ["agent_goal", "goal", "private_goal", "self_goal"]),
+            ("Conversation so far", ["dialogue_history", "conversation", "messages", "history", "transcript"]),
+        ]
+        for label, names in field_groups:
+            text = self._first_feature_text(feature, names)
+            if text:
+                sections.append(f"{label}:\n{text}")
+
+        instruction = self._first_feature_text(feature, ["instruction", "task"])
+        if instruction is None:
+            instruction = (
+                "Respond as the agent. Produce the next message only, staying consistent "
+                "with the persona and private goal."
+            )
+        sections.append(f"Task:\n{instruction}")
+        return "\n\n".join(sections)
+
+    def __call__(self, features):
+        student_prompts = []
+        for feature in features:
+            user_message = self._build_student_prompt(feature)
+            student_messages = [{"role": "user", "content": user_message}]
+            student_prompt = _apply_chat_template(
+                self.tokenizer, student_messages, enable_thinking=False
+            )
+            student_prompts.append(student_prompt)
+
+        student_encoded_no_pad = self.tokenizer(
+            student_prompts,
+            padding=False,
+            truncation=True,
+            max_length=self.max_length,
+        )
+        student_prompt_lengths = [len(ids) for ids in student_encoded_no_pad["input_ids"]]
+        max_student_prompt_len = max(student_prompt_lengths)
+
+        student_encoded = self.tokenizer(
+            student_prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_student_prompt_len,
+            return_tensors="pt",
+        )
+
+        return {
+            "student_prompts": student_encoded["input_ids"],
+            "student_prompt_attention_mask": student_encoded["attention_mask"],
+            "student_prompt_length": max_student_prompt_len,
+            "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
+            "student_prompt_texts": student_prompts,
+        }

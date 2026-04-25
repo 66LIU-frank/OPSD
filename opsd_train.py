@@ -1,5 +1,6 @@
 import os
 import wandb
+from pathlib import Path
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, GenerationConfig
@@ -92,6 +93,71 @@ class CustomScriptArguments(ScriptArguments):
             "Typical range: 0.99–0.9999. Only used when use_ema_teacher=True."
         },
     )
+    dataset_name_or_path: str = field(
+        default="siyanzhao/Openthoughts_math_30k_opsd",
+        metadata={
+            "help": "Hugging Face dataset name or local JSON/JSONL/CSV file path. "
+            "Defaults to the original OPSD math dataset."
+        },
+    )
+    dataset_config_name: str = field(
+        default=None,
+        metadata={"help": "Optional Hugging Face dataset config name."},
+    )
+    dataset_split: str = field(
+        default="train",
+        metadata={"help": "Dataset split to use for training."},
+    )
+    use_rc_opd: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable retrospective-curriculum OPD for social-agent prompts. "
+            "The trainer generates same-model reflections after each student rollout."
+        },
+    )
+    rc_reflection_levels: str = field(
+        default="step,turn,episode",
+        metadata={"help": "Comma-separated RC-OPD reflection levels: step,turn,episode."},
+    )
+    rc_curriculum_schedule: str = field(
+        default="retract",
+        metadata={"help": "RC-OPD curriculum schedule: retract, linear, constant, or none."},
+    )
+    rc_curriculum_steps: int = field(
+        default=100,
+        metadata={"help": "Number of global steps over which to retract privileged reflection context."},
+    )
+    max_reflection_length: int = field(
+        default=512,
+        metadata={"help": "Maximum tokens generated for each retrospective reflection."},
+    )
+
+
+def load_train_dataset(script_args: CustomScriptArguments):
+    dataset_path = Path(script_args.dataset_name_or_path)
+    if dataset_path.exists() and dataset_path.is_file():
+        suffix = dataset_path.suffix.lower()
+        if suffix in {".json", ".jsonl"}:
+            dataset = load_dataset("json", data_files=str(dataset_path))
+        elif suffix == ".csv":
+            dataset = load_dataset("csv", data_files=str(dataset_path))
+        else:
+            raise ValueError(
+                f"Unsupported local dataset file extension: {suffix}. Use JSON, JSONL, or CSV."
+            )
+    else:
+        if script_args.dataset_config_name:
+            dataset = load_dataset(script_args.dataset_name_or_path, script_args.dataset_config_name)
+        else:
+            dataset = load_dataset(script_args.dataset_name_or_path)
+
+    if hasattr(dataset, "keys"):
+        if script_args.dataset_split not in dataset:
+            raise ValueError(
+                f"Dataset split '{script_args.dataset_split}' not found. Available splits: {list(dataset.keys())}"
+            )
+        return dataset[script_args.dataset_split]
+    return dataset
 
 
 if __name__ == "__main__":
@@ -135,6 +201,8 @@ if __name__ == "__main__":
         # Add fixed_teacher to wandb name if enabled
         if script_args.fixed_teacher:
             full_wandb_run_config += "_fixteach"
+        if script_args.use_rc_opd:
+            full_wandb_run_config += "_rcopd"
 
     # Print configuration info
     print(f"\n{'='*80}")
@@ -181,6 +249,13 @@ if __name__ == "__main__":
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
+                "dataset_name_or_path": script_args.dataset_name_or_path,
+                "dataset_split": script_args.dataset_split,
+                "use_rc_opd": script_args.use_rc_opd,
+                "rc_reflection_levels": script_args.rc_reflection_levels if script_args.use_rc_opd else None,
+                "rc_curriculum_schedule": script_args.rc_curriculum_schedule if script_args.use_rc_opd else None,
+                "rc_curriculum_steps": script_args.rc_curriculum_steps if script_args.use_rc_opd else None,
+                "max_reflection_length": script_args.max_reflection_length if script_args.use_rc_opd else None,
             },
         )
 
@@ -249,8 +324,7 @@ if __name__ == "__main__":
     # Add presence_penalty to training_args so it can be accessed in the trainer
     training_args.presence_penalty = script_args.presence_penalty
 
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
-    train_dataset = dataset["train"]
+    train_dataset = load_train_dataset(script_args)
 
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,
@@ -266,6 +340,11 @@ if __name__ == "__main__":
         jsd_token_clip=script_args.jsd_token_clip if script_args.jsd_token_clip > 0 else None,
         use_ema_teacher=script_args.use_ema_teacher,
         ema_decay=script_args.ema_decay,
+        use_rc_opd=script_args.use_rc_opd,
+        rc_reflection_levels=script_args.rc_reflection_levels,
+        rc_curriculum_schedule=script_args.rc_curriculum_schedule,
+        rc_curriculum_steps=script_args.rc_curriculum_steps,
+        max_reflection_length=script_args.max_reflection_length,
     )
 
     if training_args.eval_strategy != "no":
