@@ -181,7 +181,7 @@ def main() -> None:
             for record in batch
         ]
         encoded = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-        prompt_lengths = encoded["attention_mask"].sum(dim=1).tolist()
+        input_width = encoded["input_ids"].shape[1]
 
         with torch.inference_mode():
             generated = model.generate(
@@ -195,8 +195,8 @@ def main() -> None:
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        for row, sequence, prompt_len in zip(batch, generated, prompt_lengths):
-            completion_ids = sequence[int(prompt_len) :]
+        for row, sequence in zip(batch, generated):
+            completion_ids = sequence[input_width:]
             prediction = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
             target = str(row.get("target_response", "")).strip()
             result = {
