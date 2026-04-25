@@ -177,6 +177,20 @@ DATASET_PATH=.sotopia_data/rc_opd/sotopia_pi_rc_opd.jsonl bash scripts/run_rc_op
 This path uses the published `sotopia_pi_episodes.jsonl` file directly and does not require Redis. Redis/Redis Stack
 is only needed if you want to run the full interactive SOTOPIA simulator or benchmark database.
 
+For the full SOTOPIA Redis database on machines without Docker/sudo, run:
+
+```bash
+bash scripts/setup_sotopia_redis_stack.sh
+export REDIS_OM_URL=redis://localhost:6380
+```
+
+This downloads Redis Stack, a local `libssl1.1`, and the SOTOPIA-pi `dump.rdb` under ignored project-local
+directories. Stop it with:
+
+```bash
+bash scripts/stop_sotopia_redis.sh
+```
+
 ### Acknowledgements
 Our implementation builds on [TRL GOLD Trainer](https://huggingface.co/docs/trl/gold_trainer). We sincerely thank [@simran135](https://github.com/simran135) and [@beanie00](https://github.com/beanie00) for identifying the prompt template bugs and the zero-2 issue, respectively!
 
