@@ -167,6 +167,16 @@ Local JSON/JSONL datasets can be passed with `--dataset_name_or_path`. The colla
 `prompt` field or structured social fields such as `scenario`, `agent_persona`, `opponent_persona`, `agent_goal`,
 `dialogue_history`, and `instruction`. See [`examples/rc_opd_social_sample.jsonl`](examples/rc_opd_social_sample.jsonl).
 
+To build an RC-OPD dataset from SOTOPIA-pi published episodes, run:
+
+```bash
+bash scripts/setup_sotopia_data.sh
+DATASET_PATH=.sotopia_data/rc_opd/sotopia_pi_rc_opd.jsonl bash scripts/run_rc_opsd_social.sh
+```
+
+This path uses the published `sotopia_pi_episodes.jsonl` file directly and does not require Redis. Redis/Redis Stack
+is only needed if you want to run the full interactive SOTOPIA simulator or benchmark database.
+
 ### Acknowledgements
 Our implementation builds on [TRL GOLD Trainer](https://huggingface.co/docs/trl/gold_trainer). We sincerely thank [@simran135](https://github.com/simran135) and [@beanie00](https://github.com/beanie00) for identifying the prompt template bugs and the zero-2 issue, respectively!
 
