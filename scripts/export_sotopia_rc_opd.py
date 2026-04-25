@@ -28,6 +28,16 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def clean_utterance(value: Any) -> str:
+    text = clean_text(value)
+    lowered = text.lower()
+    if lowered.startswith("said:"):
+        text = text[5:].strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1].strip()
+    return text
+
+
 def iter_records(path: Path) -> Iterable[dict[str, Any]]:
     suffix = path.suffix.lower()
     with path.open("r", encoding="utf-8") as f:
@@ -84,38 +94,44 @@ def fallback_agent_names(record: dict[str, Any]) -> list[str]:
     return ["Agent 1", "Agent 2"]
 
 
-def render_raw_messages(raw_messages: Any) -> str:
-    if not isinstance(raw_messages, list):
-        return clean_text(raw_messages)
+def render_actor_message(message: Any) -> tuple[str, str] | None:
+    if not isinstance(message, (list, tuple)) or len(message) < 3:
+        return None
+    sender, receiver, content = message[:3]
+    sender_text = clean_text(sender)
+    receiver_text = clean_text(receiver)
+    content_text = clean_utterance(content)
+    if (
+        not sender_text
+        or sender_text == "Environment"
+        or receiver_text != "Environment"
+        or not content_text
+        or "did nothing" in content_text.lower()
+        or "left the conversation" in content_text.lower()
+    ):
+        return None
+    return sender_text, content_text
 
-    lines: list[str] = []
-    for turn in raw_messages:
+
+def render_dialogue_from_raw_messages(raw_messages: Any) -> str:
+    return "\n".join(
+        f"{sender}: {content}"
+        for sender, content, _, _ in iter_actor_messages(raw_messages)
+    ).strip()
+
+
+def iter_actor_messages(raw_messages: Any) -> Iterable[tuple[str, str, int, int]]:
+    if not isinstance(raw_messages, list):
+        return
+    for turn_index, turn in enumerate(raw_messages):
         if not isinstance(turn, list):
-            text = clean_text(turn)
-            if text:
-                lines.append(text)
             continue
-        for message in turn:
-            if not isinstance(message, (list, tuple)) or len(message) < 3:
-                text = clean_text(message)
-                if text:
-                    lines.append(text)
+        for message_index, message in enumerate(turn):
+            rendered = render_actor_message(message)
+            if rendered is None:
                 continue
-            sender, receiver, content = message[:3]
-            sender_text = clean_text(sender)
-            receiver_text = clean_text(receiver)
-            content_text = clean_text(content)
-            if not content_text or "did nothing" in content_text.lower():
-                continue
-            if sender_text == "Environment" and receiver_text != "Environment":
-                continue
-            if receiver_text == "Environment" and sender_text:
-                lines.append(f"{sender_text}: {content_text}")
-            elif sender_text == "Environment":
-                lines.append(content_text)
-            else:
-                lines.append(f"{sender_text} -> {receiver_text}: {content_text}")
-    return "\n".join(lines).strip()
+            sender, content = rendered
+            yield sender, content, turn_index, message_index
 
 
 def first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -126,7 +142,7 @@ def first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def build_examples(record: dict[str, Any], agent_indices: list[int]) -> list[dict[str, Any]]:
+def build_full_dialogue_examples(record: dict[str, Any], agent_indices: list[int]) -> list[dict[str, Any]]:
     names = fallback_agent_names(record)
 
     personas = named_entries(
@@ -148,7 +164,7 @@ def build_examples(record: dict[str, Any], agent_indices: list[int]) -> list[dic
     scenario = first_text(record, ("scenario", "environment", "background"))
     dialogue_history = first_text(record, ("social_interactions", "dialogue_history", "conversation", "history"))
     if not dialogue_history:
-        dialogue_history = render_raw_messages(record.get("raw_messages") or record.get("messages"))
+        dialogue_history = render_dialogue_from_raw_messages(record.get("raw_messages") or record.get("messages"))
 
     examples: list[dict[str, Any]] = []
     for agent_index in agent_indices:
@@ -181,6 +197,78 @@ def build_examples(record: dict[str, Any], agent_indices: list[int]) -> list[dic
     return examples
 
 
+def build_prefix_examples(
+    record: dict[str, Any],
+    max_prefix_examples_per_episode: int,
+    max_history_chars: int,
+) -> list[dict[str, Any]]:
+    names = fallback_agent_names(record)
+    personas = dict(
+        named_entries(
+            record.get("agents_background")
+            or record.get("agent_backgrounds")
+            or [record.get("agent_persona"), record.get("opponent_persona")],
+            names,
+        )
+    )
+    goals = dict(
+        named_entries(
+            record.get("social_goals")
+            or record.get("agent_goals")
+            or [record.get("agent_goal"), record.get("opponent_goal")],
+            list(personas.keys()) or names,
+        )
+    )
+    if len(personas) < 2:
+        return []
+
+    scenario = first_text(record, ("scenario", "environment", "background"))
+    raw_messages = record.get("raw_messages") or record.get("messages")
+    actor_messages = list(iter_actor_messages(raw_messages))
+    if not actor_messages:
+        return []
+
+    examples: list[dict[str, Any]] = []
+    history: list[str] = []
+    for sender, target_response, turn_index, message_index in actor_messages:
+        if sender not in personas:
+            history.append(f"{sender}: {target_response}")
+            continue
+
+        opponent_names = [name for name in personas if name != sender]
+        opponent_name = opponent_names[0] if opponent_names else "the other participant"
+        dialogue_history = "\n".join(history).strip()
+        if max_history_chars > 0 and len(dialogue_history) > max_history_chars:
+            dialogue_history = dialogue_history[-max_history_chars:].lstrip()
+
+        examples.append(
+            {
+                "scenario": scenario,
+                "agent_persona": personas[sender],
+                "opponent_persona": personas.get(opponent_name, ""),
+                "agent_goal": goals.get(sender, ""),
+                "dialogue_history": dialogue_history or "(No prior dialogue.)",
+                "instruction": (
+                    f"Write the next message for {sender} to {opponent_name}. "
+                    "Respond with the message only, staying consistent with the persona and private goal."
+                ),
+                "target_response": target_response,
+                "source": record.get("source") or "sotopia-pi",
+                "source_episode_id": record.get("episode_id") or record.get("pk") or record.get("id"),
+                "turn_index": turn_index,
+                "message_index": message_index,
+                "agent_name": sender,
+                "opponent_name": opponent_name,
+            }
+        )
+
+        history.append(f"{sender}: {target_response}")
+        if max_prefix_examples_per_episode > 0 and len(examples) >= max_prefix_examples_per_episode:
+            break
+
+    return examples
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes-jsonl", type=Path, required=True, help="SOTOPIA episode .jsonl/.json file.")
@@ -189,7 +277,25 @@ def parse_args() -> argparse.Namespace:
         "--agent-index",
         choices=("0", "1", "both"),
         default="both",
-        help="Which agent perspective to export.",
+        help="Which agent perspective to export in full-dialogue mode.",
+    )
+    parser.add_argument(
+        "--history-mode",
+        choices=("prefix", "full"),
+        default="prefix",
+        help="prefix exports dialogue-prefix next-message samples; full exports one final prompt per agent.",
+    )
+    parser.add_argument(
+        "--max-prefix-examples-per-episode",
+        type=int,
+        default=4,
+        help="Maximum prefix samples per episode in prefix mode. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--max-history-chars",
+        type=int,
+        default=4000,
+        help="Keep only the last N dialogue-history characters in prefix mode. 0 means no truncation.",
     )
     parser.add_argument(
         "--max-examples",
@@ -217,7 +323,14 @@ def main() -> None:
     skipped = 0
     with args.output_file.open("w", encoding="utf-8") as f:
         for record in iter_records(args.episodes_jsonl):
-            examples = build_examples(record, agent_indices)
+            if args.history_mode == "prefix":
+                examples = build_prefix_examples(
+                    record,
+                    max_prefix_examples_per_episode=args.max_prefix_examples_per_episode,
+                    max_history_chars=args.max_history_chars,
+                )
+            else:
+                examples = build_full_dialogue_examples(record, agent_indices)
             for example in examples:
                 if args.require_dialogue and not example["dialogue_history"]:
                     skipped += 1

@@ -9,6 +9,9 @@ RC_OPD_DIR=${RC_OPD_DIR:-"${DATA_DIR}/rc_opd"}
 EPISODES_FILE=${EPISODES_FILE:-"${RAW_DIR}/sotopia_pi_episodes.jsonl"}
 OUTPUT_FILE=${OUTPUT_FILE:-"${RC_OPD_DIR}/sotopia_pi_rc_opd.jsonl"}
 MAX_EXAMPLES=${MAX_EXAMPLES:-20000}
+HISTORY_MODE=${HISTORY_MODE:-prefix}
+MAX_PREFIX_EXAMPLES_PER_EPISODE=${MAX_PREFIX_EXAMPLES_PER_EPISODE:-4}
+MAX_HISTORY_CHARS=${MAX_HISTORY_CHARS:-4000}
 
 HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
 HF_ENDPOINT=${HF_ENDPOINT%/}
@@ -28,6 +31,9 @@ fi
 "${PYTHON_BIN}" "${REPO_ROOT}/scripts/export_sotopia_rc_opd.py" \
     --episodes-jsonl "${EPISODES_FILE}" \
     --output-file "${OUTPUT_FILE}" \
+    --history-mode "${HISTORY_MODE}" \
+    --max-prefix-examples-per-episode "${MAX_PREFIX_EXAMPLES_PER_EPISODE}" \
+    --max-history-chars "${MAX_HISTORY_CHARS}" \
     --max-examples "${MAX_EXAMPLES}" \
     --require-dialogue
 
