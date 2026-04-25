@@ -1,4 +1,6 @@
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
+#!/bin/bash
+# 2-GPU variant: keeps effective batch size = 32 via accum=4 (vs 4x2 on 4-GPU script)
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5}
 export LIBRARY_PATH=/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs:${LIBRARY_PATH}
 export WANDB_INIT_TIMEOUT=600
 
@@ -10,16 +12,16 @@ fi
 
 accelerate launch \
     --config_file accelerate.yaml \
-    --num_processes 4 \
-    --gradient_accumulation_steps 2 \
-    --main_process_port 12950 \
+    --num_processes 2 \
+    --gradient_accumulation_steps 4 \
+    --main_process_port 12949 \
     opsd_train.py \
     --model_name_or_path /data/lsg/models/Qwen3-1.7B \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
     --per_device_train_batch_size 4 \
     --gradient_checkpointing \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 4 \
     --output_dir  /data/lsg/work/OPSD/outputs/qwen31b/ \
     --run_config qwen31b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
     --num_train_epochs 30 \

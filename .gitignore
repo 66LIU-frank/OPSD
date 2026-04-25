@@ -1,0 +1,13 @@
+# Local training and evaluation artifacts
+wandb/
+outputs/
+logs/
+eval/eval_results/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local agent/editor state
+.codex
+.claude/
