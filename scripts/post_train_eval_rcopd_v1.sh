@@ -11,8 +11,13 @@ while [[ ! -f "${CKPT}/adapter_model.safetensors" ]]; do
     sleep 60
 done
 
+TRAINER_STATE="${RUN_DIR}/trainer_state.json"
+if [[ ! -f "${TRAINER_STATE}" ]]; then
+    TRAINER_STATE="${CKPT}/trainer_state.json"
+fi
+
 /home/lsg/miniconda3/envs/opsd/bin/python /data/lsg/work/OPSD/scripts/export_trainer_log.py \
-    --trainer-state "${RUN_DIR}/trainer_state.json" \
+    --trainer-state "${TRAINER_STATE}" \
     --output-csv "${RUN_DIR}/training_curve.csv"
 
 CUDA_VISIBLE_DEVICES="${GPU}" \
